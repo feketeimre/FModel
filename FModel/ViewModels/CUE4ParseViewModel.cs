@@ -70,6 +70,7 @@ using OpenTK.Windowing.Desktop;
 using Serilog;
 using SkiaSharp;
 using UE4Config.Parsing;
+using VGAudio.Containers.Wave;
 using Application = System.Windows.Application;
 using FGuid = CUE4Parse.UE4.Objects.Core.Misc.FGuid;
 
@@ -581,6 +582,8 @@ public class CUE4ParseViewModel : ViewModel
 
     public void SaveFolder(CancellationToken cancellationToken, TreeItem folder)
         => BulkFolder(cancellationToken, folder, asset => Extract(cancellationToken, asset, TabControl.HasNoTabs, EBulkType.Properties | EBulkType.Auto));
+    public void DecompileFolder(CancellationToken cancellationToken, TreeItem folder)
+    => BulkFolder(cancellationToken, folder, asset => Extract(cancellationToken, asset, TabControl.HasNoTabs, EBulkType.Code | EBulkType.Auto));
 
     public void TextureFolder(CancellationToken cancellationToken, TreeItem folder)
         => BulkFolder(cancellationToken, folder, asset => Extract(cancellationToken, asset, TabControl.HasNoTabs, EBulkType.Textures | EBulkType.Auto));
@@ -606,6 +609,7 @@ public class CUE4ParseViewModel : ViewModel
         var saveProperties = HasFlag(bulk, EBulkType.Properties);
         var saveTextures = HasFlag(bulk, EBulkType.Textures);
         var saveAudio = HasFlag(bulk, EBulkType.Audio);
+        var saveDecompiled = HasFlag(bulk, EBulkType.Code);
         switch (entry.Extension)
         {
             case "uasset":
@@ -620,7 +624,13 @@ public class CUE4ParseViewModel : ViewModel
                     if (saveProperties) break; // do not search for viewable exports if we are dealing with jsons
                 }
 
-                for (var i = result.InclusiveStart; i < result.ExclusiveEnd; i++)
+                if (saveDecompiled || updateUi)
+                {
+                        Decompile(entry, false);
+                        TabControl.SelectedTab.SaveCode(updateUi);
+                }
+
+                    for (var i = result.InclusiveStart; i < result.ExclusiveEnd; i++)
                 {
                     if (CheckExport(cancellationToken, result.Package, i, bulk))
                         break;
@@ -1177,10 +1187,49 @@ public class CUE4ParseViewModel : ViewModel
 
         TabControl.SelectedTab.SetDocumentText(JsonConvert.SerializeObject(package, Formatting.Indented), false, false);
     }
-
-    public void Decompile(GameFile entry)
+    private String DecompileEntry(GameFile entry)
     {
-        if (TabControl.CanAddTabs) TabControl.AddTab(entry);
+
+        UClassCookedMetaData cookedMetaData = null;
+        try
+        {
+            var editorPkg = Provider.LoadPackage(entry.Path.Replace(".uasset", ".o.uasset"));
+            cookedMetaData = editorPkg.GetExport<UClassCookedMetaData>("CookedClassMetaData");
+        }
+        catch
+        {
+            // ignored
+        }
+
+        var cppList = new List<string>();
+        var pkg = Provider.LoadPackage(entry);
+        for (var i = 0; i < pkg.ExportMapLength; i++)
+        {
+            var pointer = new FPackageIndex(pkg, i + 1).ResolvedObject;
+            if (pointer?.Object is null && pointer.Class?.Object?.Value is null)
+                continue;
+
+            var dummy = ((AbstractUePackage) pkg).ConstructObject(pointer.Class?.Object?.Value as UStruct, pkg);
+            if (dummy is not UClass || pointer.Object.Value is not UClass blueprint)
+                continue;
+
+            cppList.Add(blueprint.DecompileBlueprintToPseudo(cookedMetaData));
+        }
+
+        String cpp = cppList.Count > 1 ? string.Join("\n\n", cppList) : cppList.FirstOrDefault() ?? string.Empty;
+        if (entry.Path.Contains("_Verse.uasset"))
+        {
+            cpp = Regex.Replace(cpp, "__verse_0x[a-fA-F0-9]{8}_", ""); // UnmangleCasedName
+        }
+        cpp = Regex.Replace(cpp, @"CallFunc_([A-Za-z0-9_]+)_ReturnValue", "$1");
+
+
+        return cpp;
+    }
+
+    public void Decompile(GameFile entry, bool addTab = true)
+    {
+        if (TabControl.CanAddTabs && addTab) TabControl.AddTab(entry);
         else TabControl.SelectedTab.SoftReset(entry);
 
         TabControl.SelectedTab.TitleExtra = "Decompiled";
